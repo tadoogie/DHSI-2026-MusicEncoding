@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<!-- Version 1.0 -->
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv='cache-control' content='no-cache'> 
+  <meta http-equiv='expires' content='0'> 
+  <meta http-equiv='pragma' content='no-cache'>
+  
+  <title>MY Cool Music</title><!-- Replace this with your own title -->
+  <link href="https://book.verovio.org/tutorials/midi.css" rel="stylesheet" type="text/css" />
+  <script src="https://www.verovio.org/javascript/latest/verovio-toolkit-wasm.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/combine/npm/tone@14.7.58,npm/@magenta/music@1.23.1/es6/core.js,npm/focus-visible@5,npm/html-midi-player@1.5.0"></script>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdfkit/0.13.0/pdfkit.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/blob-stream/0.1.3/blob-stream.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/svg-to-pdfkit@0.1.8/source.min.js"></script>
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 20px;
+    }
+    #notation {
+      border: 1px solid #ccc;
+      margin-top: 20px;
+      overflow-x: auto;
+    }
+    .currently-playing {
+      fill: #ff0000;
+      stroke: #ff0000;
+    }
+    #controls-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px; /* space between buttons */
+      margin-bottom: 12px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Awesome Music!</h1> <!-- Replace this text with a title for your piece -->
+  <button id="loadAudio">Load Audio</button>
+  <button id="stopMIDI">Stop</button>
+  <button id="prevPageBtn" style="margin-left:20px;">Previous Page</button>
+  <button id="nextPageBtn" style="margin-left:8px;">Next Page</button>
+  <span id="pageIndicator" style="margin-left:20px;"></span>
+  <midi-player id="verovio-midi-player" sound-font="https://storage.googleapis.com/magentadata/js/soundfonts/sgm_plus" controls="false" style="display: none;">
+  </midi-player>
+  <div id="notation"></div>
+
+
+  <script>
+document.addEventListener("DOMContentLoaded", () => {
+    let tk = null;        // Verovio toolkit instance for display
+    let meiLocation = "https://www.verovio.org/examples/downloads/Schubert_Lindenbaum.mei"; // <--- update as needed
+    let zoom = 70;
+    let trInterval = 0;
+
+    const player = document.querySelector('#verovio-midi-player');
+    const loadAudioButton = document.getElementById('loadAudio');
+    const stopMIDIButton = document.getElementById('stopMIDI');
+    const prevPageBtn = document.getElementById('prevPageBtn');
+    const nextPageBtn = document.getElementById('nextPageBtn');
+    const pageIndicator = document.getElementById('pageIndicator');
+
+    let timemap = null;
+    let currentlyHighlightedVerovioIds = new Set();
+    let highlightInterval = null;
+
+    // Page and note mapping for auto-pagination
+    let noteIdToPage = {};
+    let currentPage = 1;
+
+    function highlightNote(note, id = '') {
+        if (!note) return;
+        note.classList.add('currently-playing');
+        if (id) note.setAttribute('data-highlight', id);
+        note.querySelectorAll('g').forEach((g) => g.classList.add('currently-playing'));
+    }
+    function unhighlightNote(note) {
+        if (!note) return;
+        note.classList.remove('currently-playing');
+        note.removeAttribute('data-highlight');
+        note.querySelectorAll('.currently-playing').forEach((g) => g.classList.remove('currently-playing'));
+    }
+    function unHighlightAllElements() {
+        document.querySelectorAll('.currently-playing').forEach((g) => g.classList.remove('currently-playing'));
+    }
+
+    function showAlert(message) {
+        const alertBox = document.createElement('div');
+        alertBox.style.cssText = `
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background-color: #fff;
+            border: 1px solid #ccc;
+            padding: 20px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            z-index: 1000;
+            border-radius: 8px;
+            text-align: center;
+            font-family: sans-serif;
+            color: #333;
+        `;
+        alertBox.innerHTML = `
+            <p>${message}</p>
+            <button style="margin-top: 15px; padding: 8px 15px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer;" onclick="this.parentNode.remove()">OK</button>
+        `;
+        document.body.appendChild(alertBox);
+    }
+
+    // Map note IDs to their page number for auto-pagination
+    function buildNoteIdToPageMap(tk) {
+        noteIdToPage = {};
+        const pageCount = tk.getPageCount();
+        for (let page = 1; page <= pageCount; page++) {
+            const svg = tk.renderToSVG(page);
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = svg;
+            const notes = tempDiv.querySelectorAll('g.note[id]');
+            notes.forEach(note => {
+                noteIdToPage[note.id] = page;
+            });
+        }
+    }
+
+    function updatePageIndicator() {
+        if (tk) {
+            pageIndicator.textContent = `Page ${currentPage} of ${tk.getPageCount()}`;
+        }
+    }
+
+    function showPage(pageNum, currentTimeMs) {
+        currentPage = pageNum;
+        document.getElementById("notation").innerHTML = tk.renderToSVG(currentPage);
+        currentlyHighlightedVerovioIds.clear();
+        updatePageIndicator();
+        // After rendering, highlight notes for this tick
+        if (typeof currentTimeMs === "number") {
+            highlightNotesOnCurrentPage(currentTimeMs);
+        }
+    }
+
+    function highlightNotesOnCurrentPage(currentTimeMs) {
+        if (!timemap) return;
+        let lastEventIndex = -1;
+        for (let i = 0; i < timemap.length; i++) {
+            if (timemap[i].tstamp <= currentTimeMs) lastEventIndex = i;
+            else break;
+        }
+        if (lastEventIndex === -1) return;
+        let onNotes = new Set();
+        for (let i = 0; i <= lastEventIndex; i++) {
+            if (timemap[i].on) timemap[i].on.forEach(id => onNotes.add(id));
+            if (timemap[i].off) timemap[i].off.forEach(id => onNotes.delete(id));
+        }
+        // Only highlight notes that exist on the current page
+        onNotes.forEach(id => {
+            if (noteIdToPage[id] === currentPage) {
+                const noteElement = document.getElementById(id);
+                if (noteElement) {
+                    noteElement.classList.add("currently-playing");
+                    currentlyHighlightedVerovioIds.add(id);
+                }
+            }
+        });
+    }
+
+    function updateNoteHighlights(currentTimeMs) {
+        if (!timemap) return;
+        let lastEventIndex = -1;
+        for (let i = 0; i < timemap.length; i++) {
+            if (timemap[i].tstamp <= currentTimeMs) lastEventIndex = i;
+            else break;
+        }
+        if (lastEventIndex === -1) return;
+        let onNotes = new Set();
+        for (let i = 0; i <= lastEventIndex; i++) {
+            if (timemap[i].on) timemap[i].on.forEach(id => onNotes.add(id));
+            if (timemap[i].off) timemap[i].off.forEach(id => onNotes.delete(id));
+        }
+        // --- Auto page switch if any highlight note is not on current page ---
+        let pageToShow = null;
+        for (let id of onNotes) {
+            if (noteIdToPage[id] && noteIdToPage[id] !== currentPage) {
+                pageToShow = noteIdToPage[id];
+                break;
+            }
+        }
+        if (pageToShow && pageToShow !== currentPage) {
+            currentlyHighlightedVerovioIds.clear();
+            showPage(pageToShow, currentTimeMs);
+            return;
+        }
+
+        // Remove highlights for notes that should not be on
+        currentlyHighlightedVerovioIds.forEach(id => {
+            if (!onNotes.has(id)) {
+                const noteElement = document.getElementById(id);
+                if (noteElement) noteElement.classList.remove("currently-playing");
+                currentlyHighlightedVerovioIds.delete(id);
+            }
+        });
+
+        // Add highlights for notes that should be on
+        onNotes.forEach(id => {
+            if (!currentlyHighlightedVerovioIds.has(id)) {
+                if (noteIdToPage[id] === currentPage) {
+                    const noteElement = document.getElementById(id);
+                    if (noteElement) {
+                        noteElement.classList.add("currently-playing");
+                        currentlyHighlightedVerovioIds.add(id);
+                    }
+                }
+            }
+        });
+    }
+
+    verovio.module.onRuntimeInitialized = () => {
+        tk = new verovio.toolkit();
+
+        // Calculate pageWidth and pageHeight
+        let pWidth = window.innerWidth;
+        let pageWidthBase;
+        if (pWidth < 1270) {
+            pageWidthBase = (pWidth - 30) * 100 / zoom;
+        } else {
+            pageWidthBase = 1270 * 100 / zoom;
+        }
+        let pageHeight = window.innerHeight * 100 / zoom;
+
+        tk.setOptions({
+            pageHeight: pageHeight,
+            pageWidth: (pageWidthBase - 100) * 0.96,
+            scale: zoom,
+            adjustPageHeight: true,
+            transpose: trInterval,
+            spacingLinear: 0.35,
+            scaleToPageSize: true,
+            svgAdditionalAttribute: ["note@pname", "note@oct"]
+        });
+
+        // --- Unified Handler for 'Load Audio' button ---
+        const loadAudioAndPlayHandler = async () => {
+            player.style.display = 'block';
+            try {
+                await Tone.start();
+                console.log("Tone.js AudioContext resumed.");
+            } catch (error) {
+                console.error("Failed to resume Tone.js AudioContext:", error);
+                showAlert("Failed to start audio. Please ensure browser allows autoplay or interact with the page.");
+                return;
+            }
+
+            // Always regenerate MIDI and set src, to guarantee playback starts from beginning
+            let base64midi = tk.renderToMIDI();
+            player.src = 'data:audio/midi;base64,' + base64midi;
+
+            // Force player to reload the new source
+            if (typeof player.load === "function") player.load();
+
+            // Stop any existing playback first
+            if (typeof player.stop === "function") player.stop();
+
+            // Small timeout ensures the player has loaded the new MIDI
+            setTimeout(() => {
+                if (typeof player.start === "function") player.start();
+                console.log("player.start() called.");
+            }, 300);
+
+            // Start highlight interval (if not already running)...
+            if (highlightInterval) clearInterval(highlightInterval);
+            highlightInterval = setInterval(() => {
+                if (player && !player.paused && !player.ended) {
+                    updateNoteHighlights(player.currentTime * 1000);
+                }
+            }, 50);
+        };
+
+        // --- Stop MIDI and highlighting ---
+        const stopMIDIHandler = () => {
+            player.stop();
+            if (highlightInterval) {
+                clearInterval(highlightInterval);
+                highlightInterval = null;
+            }
+            currentlyHighlightedVerovioIds.forEach(id => {
+                const noteElement = document.getElementById(id);
+                if (noteElement) noteElement.classList.remove("currently-playing");
+            });
+            currentlyHighlightedVerovioIds.clear();
+            console.log("MIDI stopped. All highlights cleared.");
+        };
+
+        // --- Load MEI Data and Render SVG ---
+        fetch(meiLocation)
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                return response.text();
+            })
+            .then(meiXML => {
+                tk.loadData(meiXML);
+                timemap = tk.renderToTimemap();
+                buildNoteIdToPageMap(tk);
+                currentPage = 1;
+                document.getElementById("notation").innerHTML = tk.renderToSVG(currentPage);
+                updatePageIndicator();
+
+                // Attach Event Listeners
+                loadAudioButton.addEventListener("click", loadAudioAndPlayHandler);
+                stopMIDIButton.addEventListener("click", stopMIDIHandler);
+
+                prevPageBtn.addEventListener('click', () => {
+                    if (currentPage > 1) {
+                        showPage(currentPage - 1);
+                    }
+                });
+                nextPageBtn.addEventListener('click', () => {
+                    let maxPage = tk.getPageCount();
+                    if (currentPage < maxPage) {
+                        showPage(currentPage + 1);
+                    }
+                });
+            });
+    };
+});
+</script>
+</body>
+</html>
